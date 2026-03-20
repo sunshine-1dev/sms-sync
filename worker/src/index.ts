@@ -5,233 +5,285 @@ export interface Env {
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
+    const headers = { "Access-Control-Allow-Origin": "*", "Access-Control-Allow-Methods": "GET,POST,OPTIONS", "Access-Control-Allow-Headers": "Content-Type" };
 
-    // POST /api/create-room → create a new pairing room, return roomId + pairCode
+    if (request.method === "OPTIONS") {
+      return new Response(null, { headers });
+    }
+
+    // POST /api/create-room → desktop creates room
     if (url.pathname === "/api/create-room" && request.method === "POST") {
       const roomId = crypto.randomUUID();
       const id = env.RELAY_ROOM.idFromName(roomId);
       const room = env.RELAY_ROOM.get(id);
       const resp = await room.fetch(new Request("http://internal/init", { method: "POST" }));
-      const data = await resp.json() as { pairCode: string };
-      return Response.json({ roomId, pairCode: data.pairCode });
+      const data = (await resp.json()) as { pairCode: string; desktopToken: string };
+
+      // Register pairCode → roomId in lookup DO
+      const lookupId = env.RELAY_ROOM.idFromName("__lookup__");
+      const lookupDO = env.RELAY_ROOM.get(lookupId);
+      await lookupDO.fetch(new Request("http://internal/register", {
+        method: "POST",
+        body: JSON.stringify({ pairCode: data.pairCode, roomId }),
+      }));
+
+      return Response.json({ roomId, ...data }, { headers });
     }
 
-    // POST /api/join-room → Android joins with pairCode, returns roomId + token
-    if (url.pathname === "/api/join-room" && request.method === "POST") {
-      const body = await request.json() as { pairCode: string };
+    // POST /api/pair → Android pairs with code
+    if (url.pathname === "/api/pair" && request.method === "POST") {
+      const body = (await request.json()) as { pairCode: string; deviceId: string };
       if (!body.pairCode || body.pairCode.length !== 6) {
-        return Response.json({ error: "invalid pair code" }, { status: 400 });
+        return Response.json({ error: "配对码无效" }, { status: 400, headers });
       }
-      // We need to find the room by pair code - use a deterministic name based on code
-      const id = env.RELAY_ROOM.idFromName(`pair:${body.pairCode}`);
-      const room = env.RELAY_ROOM.get(id);
-      const resp = await room.fetch(new Request("http://internal/join", {
+
+      // Lookup roomId by pairCode
+      const lookupId = env.RELAY_ROOM.idFromName("__lookup__");
+      const lookupDO = env.RELAY_ROOM.get(lookupId);
+      const lookupResp = await lookupDO.fetch(new Request("http://internal/lookup", {
         method: "POST",
         body: JSON.stringify({ pairCode: body.pairCode }),
       }));
-      return new Response(resp.body, { status: resp.status, headers: resp.headers });
+      if (lookupResp.status !== 200) {
+        return Response.json({ error: "配对码不存在或已过期" }, { status: 403, headers });
+      }
+      const { roomId } = (await lookupResp.json()) as { roomId: string };
+
+      // Pair android in the room DO
+      const roomDOId = env.RELAY_ROOM.idFromName(roomId);
+      const roomDO = env.RELAY_ROOM.get(roomDOId);
+      const pairResp = await roomDO.fetch(new Request("http://internal/pair-android", {
+        method: "POST",
+        body: JSON.stringify({ deviceId: body.deviceId, roomId }),
+      }));
+      const pairData = await pairResp.json();
+      return Response.json(pairData, { status: pairResp.status, headers });
     }
 
-    // WebSocket /ws?roomId=xxx&role=android|desktop&token=xxx
+    // GET /api/room-info?roomId=xxx&token=xxx → desktop polls pair status
+    if (url.pathname === "/api/room-info" && request.method === "GET") {
+      const roomId = url.searchParams.get("roomId");
+      const token = url.searchParams.get("token");
+      if (!roomId || !token) {
+        return Response.json({ error: "missing params" }, { status: 400, headers });
+      }
+      const id = env.RELAY_ROOM.idFromName(roomId);
+      const room = env.RELAY_ROOM.get(id);
+      const resp = await room.fetch(new Request(`http://internal/info?token=${token}`));
+      const data = await resp.json();
+      return Response.json(data, { status: resp.status, headers });
+    }
+
+    // POST /api/send-code → Android HTTP fallback when WebSocket is down
+    if (url.pathname === "/api/send-code" && request.method === "POST") {
+      const body = (await request.json()) as { roomId: string; token: string; message: any };
+      if (!body.roomId || !body.token || !body.message) {
+        return Response.json({ error: "missing params" }, { status: 400, headers });
+      }
+      const id = env.RELAY_ROOM.idFromName(body.roomId);
+      const room = env.RELAY_ROOM.get(id);
+      const resp = await room.fetch(new Request("http://internal/forward", {
+        method: "POST",
+        body: JSON.stringify({ token: body.token, message: body.message }),
+      }));
+      const data = await resp.json();
+      return Response.json(data, { status: resp.status, headers });
+    }
+
+    // WebSocket: /ws?roomId=xxx&token=xxx&role=desktop|android
     if (url.pathname === "/ws") {
       const roomId = url.searchParams.get("roomId");
-      const role = url.searchParams.get("role");
-      if (!roomId || !role) {
-        return Response.json({ error: "missing roomId or role" }, { status: 400 });
+      if (!roomId) {
+        return Response.json({ error: "missing roomId" }, { status: 400, headers });
       }
       const id = env.RELAY_ROOM.idFromName(roomId);
       const room = env.RELAY_ROOM.get(id);
       return room.fetch(request);
     }
 
-    // Health check
     if (url.pathname === "/") {
-      return Response.json({ status: "ok", service: "sms-sync-relay" });
+      return Response.json({ status: "ok", service: "sms-sync-relay" }, { headers });
     }
 
-    return Response.json({ error: "not found" }, { status: 404 });
+    return Response.json({ error: "not found" }, { status: 404, headers });
   },
 };
 
 // ─── Durable Object: RelayRoom ───
 
-interface RoomState {
-  pairCode: string;
-  token: string;
-  createdAt: number;
-}
-
 interface Client {
-  ws: WebSocket;
   role: string;
-  authed: boolean;
 }
 
 export class RelayRoom {
   private state: DurableObjectState;
   private clients: Map<WebSocket, Client> = new Map();
-  private roomData: RoomState | null = null;
   private codeCache: any[] = [];
+  // Dedup: track recently forwarded code keys (code+timestamp) for 60 seconds
+  private recentIds: Map<string, number> = new Map();
 
   constructor(state: DurableObjectState) {
     this.state = state;
   }
 
+  /** Returns true if this code was already forwarded recently */
+  private isDuplicate(msg: any): boolean {
+    const key = `${msg.code}:${msg.timestamp}`;
+    const now = Date.now();
+    // Clean old entries
+    for (const [k, t] of this.recentIds) {
+      if (now - t > 60_000) this.recentIds.delete(k);
+    }
+    if (this.recentIds.has(key)) return true;
+    this.recentIds.set(key, now);
+    return false;
+  }
+
+  /** Cache a code and forward to all desktop WebSockets */
+  private forwardToDesktops(msg: any, excludeWs?: WebSocket): number {
+    msg._cachedAt = Date.now();
+    this.codeCache.push(msg);
+    this.codeCache = this.codeCache
+      .filter((c: any) => Date.now() - c._cachedAt < 5 * 60 * 1000)
+      .slice(-20);
+
+    const raw = JSON.stringify(msg);
+    const desktopSockets = this.state.getWebSockets("desktop");
+    let sent = 0;
+    for (const ws of desktopSockets) {
+      if (ws !== excludeWs) {
+        try { ws.send(raw); sent++; } catch {}
+      }
+    }
+    return sent;
+  }
+
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
-
-    if (url.pathname === "/init") {
-      return this.handleInit();
+    switch (url.pathname) {
+      case "/init": return this.handleInit();
+      case "/register": return this.handleRegister(request);
+      case "/lookup": return this.handleLookup(request);
+      case "/pair-android": return this.handlePairAndroid(request);
+      case "/info": return this.handleInfo(request);
+      case "/forward": return this.handleForward(request);
+      case "/ws": return this.handleWebSocket(request);
+      default: return Response.json({ error: "not found" }, { status: 404 });
     }
-
-    if (url.pathname === "/join") {
-      return this.handleJoin(request);
-    }
-
-    if (url.pathname === "/ws") {
-      return this.handleWebSocket(request);
-    }
-
-    return Response.json({ error: "not found" }, { status: 404 });
   }
 
+  // ── Room init ──
   private async handleInit(): Promise<Response> {
     const pairCode = String(Math.floor(100000 + Math.random() * 900000));
-    const token = crypto.randomUUID();
-
-    this.roomData = { pairCode, token, createdAt: Date.now() };
-    await this.state.storage.put("room", this.roomData);
-
-    // Also store a mapping so we can find this room by pair code
-    // We do this by creating a separate DO keyed by "pair:<code>"
-    // But since this DO IS the room, we store the roomId for lookup
-
-    return Response.json({ pairCode });
+    const desktopToken = crypto.randomUUID();
+    await this.state.storage.put("desktopToken", desktopToken);
+    await this.state.storage.put("pairCode", pairCode);
+    return Response.json({ pairCode, desktopToken });
   }
 
-  private async handleJoin(request: Request): Promise<Response> {
-    const body = await request.json() as { pairCode: string };
+  // ── Lookup DO: register pairCode → roomId ──
+  private async handleRegister(request: Request): Promise<Response> {
+    const { pairCode, roomId } = (await request.json()) as { pairCode: string; roomId: string };
+    await this.state.storage.put(`code:${pairCode}`, roomId);
+    // Auto-expire: set alarm to clean up after 30 minutes
+    return Response.json({ ok: true });
+  }
 
-    if (!this.roomData) {
-      this.roomData = await this.state.storage.get("room") as RoomState | undefined ?? null;
+  // ── Lookup DO: find roomId by pairCode ──
+  private async handleLookup(request: Request): Promise<Response> {
+    const { pairCode } = (await request.json()) as { pairCode: string };
+    const roomId = await this.state.storage.get(`code:${pairCode}`);
+    if (!roomId) {
+      return Response.json({ error: "not found" }, { status: 404 });
     }
+    return Response.json({ roomId });
+  }
 
-    if (!this.roomData || this.roomData.pairCode !== body.pairCode) {
-      return Response.json({ error: "invalid pair code" }, { status: 403 });
-    }
-
+  // ── Android pairing ──
+  private async handlePairAndroid(request: Request): Promise<Response> {
+    const { deviceId, roomId } = (await request.json()) as { deviceId: string; roomId: string };
     const androidToken = crypto.randomUUID();
     await this.state.storage.put("androidToken", androidToken);
-
-    return Response.json({
-      success: true,
-      token: androidToken,
-      roomId: this.state.id.toString(),
-    });
+    await this.state.storage.put("androidDeviceId", deviceId);
+    return Response.json({ success: true, token: androidToken, roomId });
   }
 
+  // ── Room info (for desktop to check pair status) ──
+  private async handleInfo(request: Request): Promise<Response> {
+    const url = new URL(request.url);
+    const token = url.searchParams.get("token");
+    const desktopToken = await this.state.storage.get("desktopToken");
+    if (token !== desktopToken) {
+      return Response.json({ error: "unauthorized" }, { status: 403 });
+    }
+    const paired = !!(await this.state.storage.get("androidToken"));
+    const pairCode = await this.state.storage.get("pairCode");
+    return Response.json({ paired, pairCode });
+  }
+
+  // ── HTTP forward (Android fallback when WS is down) ──
+  private async handleForward(request: Request): Promise<Response> {
+    const { token, message } = (await request.json()) as { token: string; message: any };
+    const androidToken = await this.state.storage.get("androidToken");
+    if (token !== androidToken) {
+      return Response.json({ error: "unauthorized" }, { status: 403 });
+    }
+
+    if (this.isDuplicate(message)) {
+      return Response.json({ success: true, sent: 0, deduplicated: true });
+    }
+
+    const sent = this.forwardToDesktops(message);
+    return Response.json({ success: true, sent });
+  }
+
+  // ── WebSocket ──
   private async handleWebSocket(request: Request): Promise<Response> {
     const url = new URL(request.url);
     const role = url.searchParams.get("role") || "unknown";
     const token = url.searchParams.get("token") || "";
 
+    const desktopToken = await this.state.storage.get("desktopToken");
+    const androidToken = await this.state.storage.get("androidToken");
+
+    if (token !== desktopToken && token !== androidToken) {
+      return Response.json({ error: "unauthorized" }, { status: 403 });
+    }
+
     const pair = new WebSocketPair();
-    const [client, server] = [pair[0], pair[1]];
+    const [clientSide, serverSide] = [pair[0], pair[1]];
 
-    this.state.acceptWebSocket(server);
+    this.state.acceptWebSocket(serverSide, [role]);
+    this.clients.set(serverSide, { role });
 
-    const clientInfo: Client = { ws: server, role, authed: false };
-
-    // Auto-auth for desktop (room creator) or with valid token
-    if (!this.roomData) {
-      this.roomData = await this.state.storage.get("room") as RoomState | undefined ?? null;
-    }
-
-    if (this.roomData && token === this.roomData.token) {
-      clientInfo.authed = true;
-    }
-
-    const savedAndroidToken = await this.state.storage.get("androidToken") as string | undefined;
-    if (savedAndroidToken && token === savedAndroidToken) {
-      clientInfo.authed = true;
-    }
-
-    this.clients.set(server, clientInfo);
-
-    // Send cached codes to desktop on connect
-    if (role === "desktop" && clientInfo.authed) {
+    // Send cached codes to new desktop connection
+    if (role === "desktop") {
       for (const code of this.codeCache) {
-        server.send(JSON.stringify(code));
+        serverSide.send(JSON.stringify(code));
       }
     }
 
-    server.addEventListener("message", (event) => {
-      this.handleMessage(server, event.data as string);
-    });
-
-    server.addEventListener("close", () => {
-      this.clients.delete(server);
-    });
-
-    server.addEventListener("error", () => {
-      this.clients.delete(server);
-    });
-
-    return new Response(null, { status: 101, webSocket: client });
+    return new Response(null, { status: 101, webSocket: clientSide });
   }
 
-  private handleMessage(sender: WebSocket, raw: string) {
+  // ── Hibernation API ──
+  async webSocketMessage(ws: WebSocket, message: string | ArrayBuffer) {
+    if (typeof message !== "string") return;
     let msg: any;
-    try {
-      msg = JSON.parse(raw);
-    } catch {
-      return;
-    }
-
-    const client = this.clients.get(sender);
-    if (!client) return;
+    try { msg = JSON.parse(message); } catch { return; }
 
     switch (msg.type) {
-      case "code":
-        if (!client.authed) {
-          sender.send(JSON.stringify({ type: "error", error: "not authenticated" }));
-          return;
-        }
-        // Cache the code (keep last 20, expire after 5 min)
-        msg._cachedAt = Date.now();
-        this.codeCache.push(msg);
-        this.codeCache = this.codeCache
-          .filter((c) => Date.now() - c._cachedAt < 5 * 60 * 1000)
-          .slice(-20);
-
-        // Forward to all desktop clients
-        for (const [ws, info] of this.clients) {
-          if (info.role === "desktop" && ws !== sender) {
-            try {
-              ws.send(raw);
-            } catch {}
-          }
-        }
+      case "code": {
+        if (this.isDuplicate(msg)) break;
+        this.forwardToDesktops(msg, ws);
         break;
-
+      }
       case "ping":
-        sender.send(JSON.stringify({ type: "pong" }));
+        ws.send(JSON.stringify({ type: "pong" }));
         break;
     }
   }
 
-  // Called by the runtime for hibernated WebSocket messages
-  async webSocketMessage(ws: WebSocket, message: string | ArrayBuffer) {
-    if (typeof message === "string") {
-      this.handleMessage(ws, message);
-    }
-  }
-
-  async webSocketClose(ws: WebSocket) {
-    this.clients.delete(ws);
-  }
-
-  async webSocketError(ws: WebSocket) {
-    this.clients.delete(ws);
-  }
+  async webSocketClose(ws: WebSocket) { this.clients.delete(ws); }
+  async webSocketError(ws: WebSocket) { this.clients.delete(ws); }
 }

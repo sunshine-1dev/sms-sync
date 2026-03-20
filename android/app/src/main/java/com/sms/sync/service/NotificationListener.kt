@@ -5,7 +5,6 @@ import android.service.notification.NotificationListenerService
 import android.service.notification.StatusBarNotification
 import android.util.Log
 import com.sms.sync.extractor.CodeExtractor
-import com.sms.sync.network.WebSocketClient
 
 class NotificationListener : NotificationListenerService() {
     companion object {
@@ -28,8 +27,9 @@ class NotificationListener : NotificationListenerService() {
 
         val code = CodeExtractor.extract(text)
         if (code != null) {
-            Log.i(TAG, "Code from notification (${sbn.packageName}): $code")
-            WebSocketClient.sendCode(
+            Log.i(TAG, "Code from notification (${sbn.packageName}): $code, delegating to ForegroundService")
+            SyncForegroundService.sendCode(
+                context = this,
                 source = "notification",
                 sender = "",
                 code = code,

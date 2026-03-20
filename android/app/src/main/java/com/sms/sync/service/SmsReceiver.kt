@@ -6,7 +6,6 @@ import android.content.Intent
 import android.provider.Telephony
 import android.util.Log
 import com.sms.sync.extractor.CodeExtractor
-import com.sms.sync.network.WebSocketClient
 
 class SmsReceiver : BroadcastReceiver() {
     companion object {
@@ -24,8 +23,9 @@ class SmsReceiver : BroadcastReceiver() {
 
             val code = CodeExtractor.extract(body)
             if (code != null) {
-                Log.i(TAG, "Verification code detected: $code")
-                WebSocketClient.sendCode(
+                Log.i(TAG, "Verification code detected: $code, delegating to ForegroundService")
+                SyncForegroundService.sendCode(
+                    context = context,
                     source = "sms",
                     sender = sender,
                     code = code,
