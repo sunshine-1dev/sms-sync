@@ -1,0 +1,46 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "SMS Sync Message",
+  "type": "object",
+  "required": ["type"],
+  "properties": {
+    "type": {
+      "type": "string",
+      "enum": ["code", "pair_request", "pair_response", "auth", "auth_response", "ping", "pong"]
+    },
+    "source": {
+      "type": "string",
+      "enum": ["sms", "notification"]
+    },
+    "sender": {
+      "type": "string"
+    },
+    "code": {
+      "type": "string"
+    },
+    "raw_text": {
+      "type": "string"
+    },
+    "app_name": {
+      "type": "string"
+    },
+    "timestamp": {
+      "type": "integer"
+    },
+    "device_id": {
+      "type": "string"
+    },
+    "pair_code": {
+      "type": "string"
+    },
+    "token": {
+      "type": "string"
+    },
+    "success": {
+      "type": "boolean"
+    },
+    "error": {
+      "type": "string"
+    }
+  }
+}
