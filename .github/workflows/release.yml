@@ -9,7 +9,7 @@ permissions:
   contents: write
 
 jobs:
-  build:
+  build-desktop:
     strategy:
       fail-fast: false
       matrix:
@@ -73,6 +73,7 @@ jobs:
             | macOS (Intel) | `.dmg` (x86_64) |
             | Windows | `.msi` / `.exe` |
             | Linux | `.deb` / `.AppImage` |
+            | Android | `.apk` |
 
             ## 部署中转服务
 
@@ -82,3 +83,36 @@ jobs:
           releaseDraft: false
           prerelease: false
           args: ${{ matrix.args }}
+
+  build-android:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Build APK
+        working-directory: android
+        run: ./gradlew assembleRelease
+
+      - name: Rename APK
+        run: |
+          mv android/app/build/outputs/apk/release/app-release-unsigned.apk \
+             android/app/build/outputs/apk/release/SMS-Sync-${{ github.ref_name }}.apk
+
+      - name: Upload APK to Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          files: android/app/build/outputs/apk/release/SMS-Sync-${{ github.ref_name }}.apk
