@@ -4,6 +4,14 @@
 
 [![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/sunshine-1dev/sms-sync/tree/main/worker)
 
+## 截图
+
+<p align="center">
+  <img src="screenshots/desktop.png" width="300" alt="桌面端" />
+  &nbsp;&nbsp;&nbsp;&nbsp;
+  <img src="screenshots/android.jpg" width="300" alt="Android 端" />
+</p>
+
 ## 功能特点
 
 - 自动提取短信和应用通知中的验证码
